@@ -3,27 +3,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
+from param import ModelArgs
 
-@dataclass
-class ModelArgs:
-    dim: int = 128  # 4096
-    n_layers: int = 12  # 32
-    n_heads: int = 4  # 32
-    n_kv_heads: Optional[int] = 2  # None
-    vocab_size: int = tokenizer.vocab_len  # -1
-    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
-    ffn_dim_multiplier: Optional[float] = None
-    norm_eps: float = 1e-5
-    rope_theta: float = 10000  # 500000
 
-    max_batch_size: int = 24  # 32
-    max_seq_len: int = 512  # 8192 but their maximum chunk size when running inference is 2048
-
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
-    dropout_rate: float = 0.1
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
 
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
@@ -139,5 +129,123 @@ class Attention(nn.Module):
 
         output = torch.matmul(scores, values)  # (bs, n_heads, seqlen, head_dim)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        
+
         return self.wo(output)
+
+
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        multiple_of: int,
+        ffn_dim_multiplier: Optional[float],
+    ):
+        super().__init__()
+        hidden_dim = int(2 * hidden_dim / 3)
+        # custom dim factor multiplier
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+
+        self.w1 = nn.Linear(dim, hidden_dim, bias=False)
+        self.w2 = nn.Linear(hidden_dim, dim, bias=False)
+        self.w3 = nn.Linear(dim, hidden_dim, bias=False)
+
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class TransformerBlock(nn.Module):
+    def __init__(self, layer_id: int, args: ModelArgs):
+        super().__init__()
+        self.n_heads = args.n_heads
+        self.dim = args.dim
+        self.head_dim = args.dim // args.n_heads
+        self.attention = Attention(args)
+        self.feed_forward = FeedForward(
+            dim=args.dim,
+            hidden_dim=4 * args.dim,
+            multiple_of=args.multiple_of,
+            ffn_dim_multiplier=args.ffn_dim_multiplier,
+        )
+        self.layer_id = layer_id
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.dropout_rate = args.dropout_rate
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        start_pos: int = None,
+        training=True,
+    ):
+        h = x + F.dropout(self.attention(self.attention_norm(x), freqs_cis, mask, start_pos), p=self.dropout_rate,
+                          training=training)
+        out = h + F.dropout(self.feed_forward(self.ffn_norm(h)), p=self.dropout_rate, training=training)
+        return out
+
+
+class Llama3(nn.Module):
+    def __init__(self, params: ModelArgs, tokenizer):
+        super().__init__()
+        self.params = params
+        self.vocab_size = params.vocab_size
+        self.n_layers = params.n_layers
+        self.max_seq_len = params.max_seq_len
+        self.tokenizer = tokenizer
+
+        self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+
+        self.layers = nn.ModuleList()
+        for layer_id in range(params.n_layers):
+            self.layers.append(TransformerBlock(layer_id, params))
+
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        self.output = nn.Linear(params.dim, params.vocab_size, bias=False)
+
+        self.freqs_cis = precompute_freqs_cis(
+            params.dim // params.n_heads,
+            params.max_seq_len * 2,
+            params.rope_theta,
+        )
+
+        mask = torch.full((params.max_seq_len, params.max_seq_len),
+                          float("-inf"),
+                          device=params.device)
+        mask = torch.triu(mask, diagonal=1)
+        self.register_buffer('mask', mask)
+
+        self.criterion = nn.CrossEntropyLoss()
+
+    def forward(
+        self,  # specifically for training
+        tokens: torch.Tensor,
+        targets: torch.Tensor
+    ):
+        bsz, seqlen = tokens.shape
+        assert tokens.shape == targets.shape
+        assert seqlen == self.max_seq_len
+        h = self.tok_embeddings(tokens)
+        # freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[:seqlen].to(self.params.device)
+
+        for layer in self.layers:
+            h = layer(
+                h,
+                freqs_cis,
+                self.mask,
+                start_pos=None,
+                training=True
+            )
+        h = self.norm(h)
+        logits = self.output(h).float()
+
+        loss = self.criterion(
+            logits.view(bsz * seqlen, self.vocab_size),
+            targets.reshape(bsz * seqlen)
+        )
+
+        return logits, loss
